@@ -133,6 +133,7 @@ th { color: var(--muted); font-weight: 600; font-size: 0.85rem; }
 .row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-bottom: 0.75rem; }
 .msg { margin-top: 0.6rem; color: var(--warn); min-height: 1.2em; }
 .ok { color: var(--lime); }
+.sub { margin-top: 0.25rem; color: var(--muted); font-size: 0.78rem; }
 .tag {
   display: inline-block;
   padding: 0.15rem 0.45rem;

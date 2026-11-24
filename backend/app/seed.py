@@ -55,8 +55,11 @@ def seed_if_empty() -> None:
                 "INSERT INTO guns(pile_id,name,status) VALUES(?,?, '可用')",
                 (pid, "单枪"),
             )
-        # 一桩维护
+        # 一桩维护（枪线同步停用，保持桩态/枪线口径一致）
         conn.execute("UPDATE piles SET status='维护' WHERE name='河甲四号'")
+        conn.execute(
+            "UPDATE guns SET status='故障' WHERE pile_id=(SELECT id FROM piles WHERE name='河甲四号')"
+        )
         conn.execute(
             "INSERT INTO day_seals(business_day,sealed,sealed_at,note) VALUES(?,?,NULL,'')",
             (today(), 0),

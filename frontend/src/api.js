@@ -37,6 +37,15 @@ export const api = {
   解封: () => req('/充日/解封', { method: 'POST', body: '{}' }),
   设置: () => req('/设置'),
   写设置: (body) => req('/设置', { method: 'POST', body: JSON.stringify(body) }),
-  改桩态: (id, 状态) =>
-    req(`/桩位/${id}/状态`, { method: 'POST', body: JSON.stringify({ 状态 }) }),
+  改桩态: (id, 状态, opts = {}) =>
+    req(`/桩位/${id}/状态`, {
+      method: 'POST',
+      body: JSON.stringify({
+        状态,
+        请求号: opts.请求号,
+        备注: opts.备注 || '',
+      }),
+    }),
+  桩态事件: (id) => req(`/桩位/${id}/状态事件`),
+  口径体检: () => req('/口径体检'),
 }

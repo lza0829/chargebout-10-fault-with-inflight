@@ -2,14 +2,15 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from app.db import db
-from app.services import core
-from app.services.sessions import set_pile_status
+from app.services import core, piles as pile_svc
 
 router = APIRouter()
 
 
 class PileStatusIn(BaseModel):
     状态: str
+    请求号: str | None = None
+    备注: str = ""
 
 
 class PileIn(BaseModel):
@@ -43,4 +44,31 @@ def create_pile(body: PileIn):
 @router.post("/桩位/{pile_id}/状态")
 def change_status(pile_id: int, body: PileStatusIn):
     with db() as conn:
-        return set_pile_status(conn, pile_id, body.状态)
+        return pile_svc.set_pile_status(
+            conn,
+            pile_id,
+            body.状态,
+            request_key=body.请求号,
+            note=body.备注,
+        )
+
+
+@router.get("/桩位/{pile_id}/状态事件")
+def pile_events(pile_id: int):
+    with db() as conn:
+        pile = conn.execute("SELECT * FROM piles WHERE id=?", (pile_id,)).fetchone()
+        if not pile:
+            raise HTTPException(404, detail="桩位不存在")
+        return pile_svc.list_pile_events(conn, pile_id)
+
+
+@router.get("/桩态回执")
+def status_receipt(请求号: str):
+    with db() as conn:
+        return pile_svc.get_receipt_by_request(conn, 请求号)
+
+
+@router.get("/口径体检")
+def consistency():
+    with db() as conn:
+        return pile_svc.audit_consistency(conn)

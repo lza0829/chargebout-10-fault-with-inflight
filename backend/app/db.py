@@ -85,13 +85,50 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pile_status_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pile_id INTEGER NOT NULL,
+  from_status TEXT NOT NULL,
+  to_status TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  request_key TEXT,
+  receipt_no TEXT,
+  interrupted_count INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(pile_id) REFERENCES piles(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_pile_status_req ON pile_status_events(request_key);
+CREATE INDEX IF NOT EXISTS ix_pile_status_pile ON pile_status_events(pile_id, id);
+CREATE TABLE IF NOT EXISTS session_interrupts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL,
+  pile_id INTEGER NOT NULL,
+  pile_event_id INTEGER NOT NULL,
+  from_status TEXT NOT NULL,
+  to_status TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  receipt_no TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE(pile_event_id, session_id),
+  FOREIGN KEY(session_id) REFERENCES sessions(id),
+  FOREIGN KEY(pile_id) REFERENCES piles(id),
+  FOREIGN KEY(pile_event_id) REFERENCES pile_status_events(id)
+);
+CREATE INDEX IF NOT EXISTS ix_session_intr_session ON session_interrupts(session_id);
 """
 
 
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # isolation_level=None -> we drive transactions explicitly with BEGIN IMMEDIATE,
+    # so every write path is one atomic unit (no half-written cross-table state).
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
+    # WAL + NORMAL：改桩态与中断同笔提交时既保原子又不被逐条 fsync 拖垮。
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -99,18 +136,24 @@ def connect() -> sqlite3.Connection:
 def db():
     conn = connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         yield conn
-        conn.commit()
+        conn.execute("COMMIT")
     except Exception:
-        conn.rollback()
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
         raise
     finally:
         conn.close()
 
 
 def init_db() -> None:
-    with db() as conn:
+    # executescript() commits implicitly, so it must NOT run inside the db() tx wrapper.
+    conn = connect()
+    try:
         conn.executescript(SCHEMA)
+    finally:
+        conn.close()
 
 
 def row_dict(row: sqlite3.Row | None) -> dict | None:

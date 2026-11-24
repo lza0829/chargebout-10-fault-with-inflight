@@ -13,6 +13,17 @@ def _next_slip(conn) -> str:
     return f"充{n}"
 
 
+def release_occupancy(conn, pile_id: int, gun_id: int) -> None:
+    """释放占用。桩若已处于故障/维护，不得被会话收口反向改成空闲。"""
+    pile = conn.execute("SELECT status FROM piles WHERE id=?", (pile_id,)).fetchone()
+    if pile and pile["status"] not in ("故障", "维护"):
+        conn.execute("UPDATE piles SET status='空闲' WHERE id=?", (pile_id,))
+        conn.execute("UPDATE guns SET status='可用' WHERE id=?", (gun_id,))
+    elif pile:
+        # 停用桩：枪线保持故障，桩态不动。
+        conn.execute("UPDATE guns SET status='故障' WHERE id=?", (gun_id,))
+
+
 def open_session(conn, pile_id: int, gun_id: int | None = None) -> dict:
     if is_day_sealed(conn):
         raise HTTPException(400, detail="充日已封印，禁止新开充")
@@ -78,6 +89,10 @@ def add_pulse(conn, session_id: int, delta_kwh: float, power_kw: float = 0) -> d
         raise HTTPException(404, detail="会话不存在")
     if se["status"] != "充电中":
         raise HTTPException(400, detail=f"会话状态为{se['status']}，不可记脉冲")
+    pile = conn.execute("SELECT status FROM piles WHERE id=?", (se["pile_id"],)).fetchone()
+    if pile and pile["status"] in ("故障", "维护"):
+        # 兜底：桩已停用不得再进电量（口径不允许「桩已故障却仍在充电中」）。
+        raise HTTPException(400, detail=f"桩位当前为{pile['status']}，不可记脉冲")
     ts = now_str()
     conn.execute(
         "INSERT INTO pulses(session_id,delta_kwh,power_kw,created_at) VALUES(?,?,?,?)",
@@ -106,12 +121,15 @@ def settle(conn, session_id: int) -> dict:
     ts = now_str()
     price = float(se["price_locked"] or current_band_price(conn, se["rate_plan_id"]))
     amount = round(float(se["kwh"]) * price, 2)
-    conn.execute(
-        "UPDATE sessions SET status='已关账', amount=?, closed_at=?, price_locked=? WHERE id=?",
+    # 条件更新：并发下只有一方能完成 充电中/结算中/已超时 → 已关账，杜绝双终态。
+    cur = conn.execute(
+        """UPDATE sessions SET status='已关账', amount=?, closed_at=?, price_locked=?
+           WHERE id=? AND status IN ('充电中','结算中','已超时')""",
         (amount, ts, price, session_id),
     )
-    conn.execute("UPDATE piles SET status='空闲' WHERE id=?", (se["pile_id"],))
-    conn.execute("UPDATE guns SET status='可用' WHERE id=?", (se["gun_id"],))
+    if cur.rowcount != 1:
+        raise HTTPException(409, detail="会话已被同笔或另一笔操作收口，请刷新")
+    release_occupancy(conn, se["pile_id"], se["gun_id"])
     conn.execute(
         "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
         (session_id, "结算关账", ts, f"金额{amount}"),
@@ -127,10 +145,12 @@ def mark_timeout(conn, session_id: int) -> dict:
         raise HTTPException(400, detail=f"会话状态为{se['status']}，不可标超时")
     minutes = int(get_setting(conn, "超时分钟", "120"))
     ts = now_str()
-    conn.execute(
-        "UPDATE sessions SET status='已超时', note=? WHERE id=?",
+    cur = conn.execute(
+        "UPDATE sessions SET status='已超时', note=? WHERE id=? AND status='充电中'",
         (f"超过{minutes}分钟未关", session_id),
     )
+    if cur.rowcount != 1:
+        raise HTTPException(409, detail="会话已被另一笔操作收口，请刷新")
     conn.execute(
         "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
         (session_id, "超时", ts, f"阈值{minutes}分钟"),
@@ -145,12 +165,14 @@ def abort_session(conn, session_id: int, reason: str = "急停") -> dict:
     if se["status"] not in ("充电中", "结算中", "已超时"):
         raise HTTPException(400, detail=f"会话状态为{se['status']}，不可中断")
     ts = now_str()
-    conn.execute(
-        "UPDATE sessions SET status='已中断', closed_at=?, note=? WHERE id=?",
+    cur = conn.execute(
+        """UPDATE sessions SET status='已中断', closed_at=?, note=?
+           WHERE id=? AND status IN ('充电中','结算中','已超时')""",
         (ts, reason, session_id),
     )
-    conn.execute("UPDATE piles SET status='空闲' WHERE id=?", (se["pile_id"],))
-    conn.execute("UPDATE guns SET status='可用' WHERE id=?", (se["gun_id"],))
+    if cur.rowcount != 1:
+        raise HTTPException(409, detail="会话已被另一笔操作收口，请刷新")
+    release_occupancy(conn, se["pile_id"], se["gun_id"])
     conn.execute(
         "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
         (session_id, "异常中断", ts, reason),
@@ -158,20 +180,34 @@ def abort_session(conn, session_id: int, reason: str = "急停") -> dict:
     return {"会话编号": session_id, "状态": "已中断", "原因": reason}
 
 
-def set_pile_status(conn, pile_id: int, status: str) -> dict:
-    if status not in ("空闲", "占用", "故障", "维护"):
-        raise HTTPException(400, detail="非法桩位状态")
-    pile = conn.execute("SELECT * FROM piles WHERE id=?", (pile_id,)).fetchone()
-    if not pile:
-        raise HTTPException(404, detail="桩位不存在")
-    open_se = conn.execute(
-        "SELECT id FROM sessions WHERE pile_id=? AND status IN ('充电中','结算中')",
-        (pile_id,),
-    ).fetchone()
-    if open_se and status in ("故障", "维护"):
-        # 底座默认：置故障/维护时若仍有在充，拒绝（后续题可改互斥）
-        raise HTTPException(400, detail="仍有在充会话，不可直接改故障或维护")
-    if status == "空闲" and open_se:
-        raise HTTPException(400, detail="仍有在充会话，不可改空闲")
-    conn.execute("UPDATE piles SET status=? WHERE id=?", (status, pile_id))
-    return {"桩位编号": pile_id, "状态": status}
+def force_interrupt_for_pile_event(
+    conn, se, *, pile_event_id: int, reason: str, note_fmt: str
+) -> str:
+    """改故障/维护联动中断：与桩位状态事件同笔提交，落中断回执与会话事件。
+
+    金额不回算（中断不自动结算，金额停留在当前预估），状态收口为 已中断。
+    """
+    ts = now_str()
+    from_status = se["status"]
+    cur = conn.execute(
+        """UPDATE sessions SET status='已中断', closed_at=?, note=?
+           WHERE id=? AND status IN ('充电中','结算中')""",
+        (ts, reason, se["id"]),
+    )
+    if cur.rowcount != 1:
+        # 同一桩位事件内不应有并发收口；真发生了就整笔回滚，避免半截。
+        raise HTTPException(409, detail=f"会话{se['id']}状态已变，请重试")
+
+    receipt_no = f"中断{pile_event_id}-{se['id']}"
+    conn.execute(
+        """INSERT INTO session_interrupts(session_id,pile_id,pile_event_id,from_status,to_status,
+                                           reason,receipt_no,created_at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (se["id"], se["pile_id"], pile_event_id, from_status, "已中断", reason, receipt_no, ts),
+    )
+    conn.execute(
+        "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
+        (se["id"], "强制中断", ts, note_fmt),
+    )
+    conn.execute("UPDATE guns SET status='故障' WHERE id=?", (se["gun_id"],))
+    return receipt_no
